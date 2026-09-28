@@ -11,6 +11,75 @@ from torch.nn import functional as F
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
+_AO_OPT_15 = int(os.environ.get('AUTOOPTM_OPT_2', '16'))
+
+
+def _ao_on(name):
+    return os.environ.get(name, '1') != '0'
+
+
+def _ao_opt_13(out_t, alpha_t, img_mode):
+    def bgr(t):
+        t = t.data.squeeze(0).float().clamp_(0, 1)
+        return t[[2, 1, 0], :, :].permute(1, 2, 0)
+
+    def gray(t):                                    # COLOR_BGR2GRAY
+        return t[:, :, 0] * 0.114 + t[:, :, 1] * 0.587 + t[:, :, 2] * 0.299
+
+    out = bgr(out_t)
+    if img_mode == 'L':
+        out = gray(out)
+    elif img_mode == 'RGBA':
+        out = torch.cat([out, gray(bgr(alpha_t)).unsqueeze(-1)], dim=-1)
+    return out.mul_(255.0).round_().to(torch.uint8).contiguous().cpu().numpy()
+
+
+_AO_T = [[0.0, 0.0, 1.0], [0.0, 1.0, 1.0], [1.0, 1.0, 0.0], [1.0, 0.0, 0.0]]
+
+
+def _ao_opt_14(model):
+    from torch import nn
+    needed = ('conv_first', 'conv_body', 'body', 'conv_up1', 'conv_up2',
+              'conv_hr', 'conv_last', 'lrelu')
+    if not all(hasattr(model, a) for a in needed):
+        return False                    # not an RRDBNet (the compact nets differ)
+    if model.conv_up1.kernel_size != (3, 3) or model.conv_up1.stride != (1, 1):
+        return False
+
+    def convert(conv):
+        w = conv.weight.detach().float()
+        T = torch.tensor(_AO_T, device=w.device, dtype=w.dtype)
+        ct = nn.ConvTranspose2d(conv.in_channels, conv.out_channels, 4, 2, 1,
+                                bias=conv.bias is not None)
+        ct.weight.data.copy_(torch.einsum('ku,oiuv,lv->iokl', T, w, T).to(ct.weight.dtype))
+        if conv.bias is not None:
+            ct.bias.data.copy_(conv.bias.detach().float().to(ct.bias.dtype))
+        return ct.to(device=conv.weight.device, dtype=conv.weight.dtype)
+
+    up1, up2 = convert(model.conv_up1), convert(model.conv_up2)
+
+    def forward(x):
+        feat = model.conv_first(x)
+        feat = feat + model.conv_body(model.body(feat))
+        feat = model.lrelu(up1(feat))
+        feat = model.lrelu(up2(feat))
+        return model.conv_last(model.lrelu(model.conv_hr(feat)))
+
+    # Prove the rewrite on a small probe before trusting it with real images.
+    with torch.no_grad():
+        probe = torch.randn(1, model.conv_first.in_channels, 32, 40,
+                            device=model.conv_first.weight.device,
+                            dtype=model.conv_first.weight.dtype)
+        ref = model(probe).float()
+        err = (forward(probe).float() - ref).abs().max().item()
+        scale = ref.abs().max().item() or 1.0
+    if err / scale > 5e-3:
+        print('[autooptm] optimized path disagrees by %.3g; keeping the stock path' % err)
+        return False
+    model.up1, model.up2, model.forward = up1, up2, forward
+    return True
+
+
 class RealESRGANer():
     """A helper class for upsampling images with RealESRGAN.
 
@@ -74,6 +143,13 @@ class RealESRGANer():
         if self.half:
             self.model = self.model.half()
 
+        if _ao_on('AUTOOPTM_OPT_3'):
+            _ao_opt_14(self.model)
+        if self.device.type == 'cuda' and _ao_on('AUTOOPTM_OPT_4'):
+            torch.backends.cudnn.benchmark = True
+        if self.device.type == 'cuda' and _ao_on('AUTOOPTM_OPT_5'):
+            self.model = self.model.to(memory_format=torch.channels_last)
+
     def dni(self, net_a, net_b, dni_weight, key='params', loc='cpu'):
         """Deep network interpolation.
 
@@ -109,10 +185,58 @@ class RealESRGANer():
             if (w % self.mod_scale != 0):
                 self.mod_pad_w = (self.mod_scale - w % self.mod_scale)
             self.img = F.pad(self.img, (0, self.mod_pad_w, 0, self.mod_pad_h), 'reflect')
+        if self.img.is_cuda and _ao_on('AUTOOPTM_OPT_5'):
+            self.img = self.img.contiguous(memory_format=torch.channels_last)
 
     def process(self):
         # model inference
-        self.output = self.model(self.img)
+        runner = self._ao_opt_16()
+        self.output = runner(self.img) if runner is not None else self.model(self.img)
+
+    def _ao_opt_16(self):
+        if getattr(self, '_ao_off', False) or self.device.type != 'cuda':
+            return None
+        if not hasattr(self, '_ao_opt_18'):
+            self._ao_opt_18 = {}
+            if _ao_on('AUTOOPTM_OPT_6'):
+                from basicsr.archs.rrdbnet_arch import RRDB
+                if not getattr(RRDB, '_ao_opt_21', False):
+                    RRDB.forward = torch.compile(RRDB.forward)
+                    RRDB._ao_opt_21 = True
+        if not _ao_on('AUTOOPTM_OPT_7'):
+            return self.model
+        key = tuple(self.img.shape)
+        hit = self._ao_opt_18.get(key)
+        if hit is None:
+            if len(self._ao_opt_18) >= _AO_OPT_15:
+                return self.model
+            try:
+                opt_19 = torch.empty_like(self.img)
+                opt_19.copy_(self.img)
+                side = torch.cuda.Stream()
+                side.wait_stream(torch.cuda.current_stream())
+                with torch.cuda.stream(side):
+                    for _ in range(3):
+                        self.model(opt_19)
+                torch.cuda.current_stream().wait_stream(side)
+                g = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(g):
+                    opt_20 = self.model(opt_19)
+            except RuntimeError as error:
+                print('[autooptm] optimized path unavailable:', error)
+                self._ao_off = True
+                return self.model
+            hit = (g, opt_19, opt_20)
+            self._ao_opt_18[key] = hit
+
+        def replay(x, _hit=hit):
+            g, opt_19, opt_20 = _hit
+            opt_19.copy_(x)
+            g.replay()
+            return opt_20.clone()
+
+        return replay
+
 
     def tile_process(self):
         """It will first crop input images to tiles, and then process each tile.
@@ -215,6 +339,10 @@ class RealESRGANer():
             img_mode = 'RGB'
             img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
 
+        _ao_opt_17 = (self.device.type == 'cuda' and max_range == 255
+                   and alpha_upsampler == 'realesrgan'
+                   and _ao_on('AUTOOPTM_OPT_8'))
+
         # ------------------- process image (without the alpha channel) ------------------- #
         self.pre_process(img)
         if self.tile_size > 0:
@@ -222,10 +350,12 @@ class RealESRGANer():
         else:
             self.process()
         output_img = self.post_process()
-        output_img = output_img.data.squeeze().float().cpu().clamp_(0, 1).numpy()
-        output_img = np.transpose(output_img[[2, 1, 0], :, :], (1, 2, 0))
-        if img_mode == 'L':
-            output_img = cv2.cvtColor(output_img, cv2.COLOR_BGR2GRAY)
+        output_img_t, output_alpha_t = output_img, None
+        if not _ao_opt_17:
+            output_img = output_img.data.squeeze().float().cpu().clamp_(0, 1).numpy()
+            output_img = np.transpose(output_img[[2, 1, 0], :, :], (1, 2, 0))
+            if img_mode == 'L':
+                output_img = cv2.cvtColor(output_img, cv2.COLOR_BGR2GRAY)
 
         # ------------------- process the alpha channel if necessary ------------------- #
         if img_mode == 'RGBA':
@@ -236,19 +366,24 @@ class RealESRGANer():
                 else:
                     self.process()
                 output_alpha = self.post_process()
-                output_alpha = output_alpha.data.squeeze().float().cpu().clamp_(0, 1).numpy()
-                output_alpha = np.transpose(output_alpha[[2, 1, 0], :, :], (1, 2, 0))
-                output_alpha = cv2.cvtColor(output_alpha, cv2.COLOR_BGR2GRAY)
+                output_alpha_t = output_alpha
+                if not _ao_opt_17:
+                    output_alpha = output_alpha.data.squeeze().float().cpu().clamp_(0, 1).numpy()
+                    output_alpha = np.transpose(output_alpha[[2, 1, 0], :, :], (1, 2, 0))
+                    output_alpha = cv2.cvtColor(output_alpha, cv2.COLOR_BGR2GRAY)
             else:  # use the cv2 resize for alpha channel
                 h, w = alpha.shape[0:2]
                 output_alpha = cv2.resize(alpha, (w * self.scale, h * self.scale), interpolation=cv2.INTER_LINEAR)
 
             # merge the alpha channel
-            output_img = cv2.cvtColor(output_img, cv2.COLOR_BGR2BGRA)
-            output_img[:, :, 3] = output_alpha
+            if not _ao_opt_17:
+                output_img = cv2.cvtColor(output_img, cv2.COLOR_BGR2BGRA)
+                output_img[:, :, 3] = output_alpha
 
         # ------------------------------ return ------------------------------ #
-        if max_range == 65535:  # 16-bit image
+        if _ao_opt_17:
+            output = _ao_opt_13(output_img_t, output_alpha_t, img_mode)
+        elif max_range == 65535:  # 16-bit image
             output = (output_img * 65535.0).round().astype(np.uint16)
         else:
             output = (output_img * 255.0).round().astype(np.uint8)

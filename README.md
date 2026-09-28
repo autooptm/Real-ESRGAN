@@ -1,3 +1,65 @@
+<div align="center">
+  <a href="https://autooptm.com"><img src=".autooptm/logo.png" width="96" alt="AutoOptm"></a>
+
+  <h1>Real-ESRGAN · optimized by <a href="https://autooptm.com">AutoOptm</a></h1>
+
+  <p><b>3.35x faster end to end</b> on the command below, output verified against the stock program.</p>
+
+  <p>
+    <a href="https://autooptm.com"><img alt="speedup" src="https://img.shields.io/badge/end--to--end-3.35x-2ea44f"></a>
+    <a href="https://github.com/xinntao/Real-ESRGAN/commit/a4abfb2979a7bbff3f69f58f58ae324608821e27"><img alt="base" src="https://img.shields.io/badge/upstream-a4abfb2979a7-blue"></a>
+    <img alt="card" src="https://img.shields.io/badge/measured%20on-NVIDIA%20RTX%204090-lightgrey">
+  </p>
+</div>
+
+> This is a fork of [xinntao/Real-ESRGAN](https://github.com/xinntao/Real-ESRGAN) at commit
+> [`a4abfb2979a7`](https://github.com/xinntao/Real-ESRGAN/commit/a4abfb2979a7bbff3f69f58f58ae324608821e27) with the AutoOptm patch applied on top.
+> The optimisation was found, measured and verified automatically by [AutoOptm](https://autooptm.com);
+> the patch is also kept at [`.autooptm/autooptm.patch`](.autooptm/autooptm.patch).
+
+## The result
+
+| | |
+|---|---|
+| **Command** | `python inference_realesrgan.py -n RealESRGAN_x4plus -i inputs` |
+| **Entry point** | `inference_realesrgan.py` |
+| **Unit measured** | one input image: decode → 4x RRDBNet (fp16) → post-process → encode + write |
+| **Before (stock)** | 252 ms per unit |
+| **After (this tree, all switches default ON)** | 67.9 ms per unit |
+| **Speedup** | **3.35x** end to end, noise floor of the host 0.8% (median of 5 repeats) |
+| **Output** | default tree: PSNR 59.8 dB against the stock output (RMSE 0.26 of one 8-bit code; the program's own uint8 quantization spends half a code). The changes that keep the output bit-exact give 2.14x on their own; every change that moves the output has its own switch. |
+
+### What changed
+
+| File | Where | Gain (alone) |
+|---|---|---|
+| `inference_realesrgan.py` | module scope + the write at the end of the per-image loop | 1.611x |
+| `realesrgan/utils.py` | RealESRGANer.enhance | 1.262x |
+| `realesrgan/utils.py` | RealESRGANer.__init__ / RealESRGANer.pre_process | 1.188x |
+| `realesrgan/utils.py` | RealESRGANer.__init__ | 1.106x |
+| `realesrgan/utils.py` | RealESRGANer.process | 1.172x |
+| `realesrgan/utils.py` | RealESRGANer.__init__ | 1.029x |
+
+
+
+## Reproduce
+
+```bash
+git clone https://github.com/autooptm/Real-ESRGAN-ao.git
+cd Real-ESRGAN-ao
+# set up exactly as upstream documents, then:
+python inference_realesrgan.py -n RealESRGAN_x4plus -i inputs
+```
+
+The diff against upstream is one commit: `git log -1 -p` shows it, and
+`git diff a4abfb2979a7` is the same patch as `.autooptm/autooptm.patch`.
+
+---
+
+<div align="center"><sub>Optimized by <a href="https://autooptm.com">AutoOptm</a> — point it at a repository, get back a verified speedup and the patch.</sub></div>
+
+---
+
 <p align="center">
   <img src="assets/realesrgan_logo.png" height=120>
 </p>

@@ -1,12 +1,37 @@
 import argparse
+import atexit
 import cv2
 import glob
 import os
+import threading
 from basicsr.archs.rrdbnet_arch import RRDBNet
 from basicsr.utils.download_util import load_file_from_url
 
 from realesrgan import RealESRGANer
 from realesrgan.archs.srvgg_arch import SRVGGNetCompact
+
+_AO_OPT_10 = 4
+_ao_opt_11 = None
+if os.environ.get('AUTOOPTM_OPT_1', '1') != '0':
+    from concurrent.futures import ThreadPoolExecutor
+    _ao_opt_11 = ThreadPoolExecutor(max_workers=2)
+    _ao_opt_12 = threading.Semaphore(_AO_OPT_10)
+    atexit.register(lambda: _ao_opt_11.shutdown(wait=True))
+
+
+def _ao_opt_9(path, img):
+    if _ao_opt_11 is None:
+        cv2.imwrite(path, img)
+        return
+    _ao_opt_12.acquire()
+
+    def _job():
+        try:
+            cv2.imwrite(path, img)
+        finally:
+            _ao_opt_12.release()
+
+    _ao_opt_11.submit(_job)
 
 
 def main():
@@ -159,7 +184,7 @@ def main():
                 save_path = os.path.join(args.output, f'{imgname}.{extension}')
             else:
                 save_path = os.path.join(args.output, f'{imgname}_{args.suffix}.{extension}')
-            cv2.imwrite(save_path, output)
+            _ao_opt_9(save_path, output)
 
 
 if __name__ == '__main__':
